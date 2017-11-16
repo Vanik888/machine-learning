@@ -3,15 +3,31 @@
 import pandas as pd
 import numpy as np
 import cPickle as pickle
+import math as mth
 import operator
+import logging
 
 from collections import Counter, defaultdict
 
 tree_dump_file = 'tree.txt'
 training_file = './gene_expression_training_orig_full.csv'
 test_file = './gene_expression_test_orig_full.csv'
+log_file = './decision_tree.log'
 trisomic = 1
 healthy = 0
+
+
+logger = logging.getLogger('decision tree logger')
+fh = logging.FileHandler(log_file)
+fh.setLevel(logging.DEBUG)
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+fh.setFormatter(formatter)
+ch.setFormatter(formatter)
+logger.addHandler(fh)
+logger.addHandler(ch)
+
 
 class Node:
     def __init__(self):
@@ -37,6 +53,9 @@ class Node:
             self.trisomic_patterns,
             self.left,
             self.right)
+
+    def __repr__(self):
+        return 'name: %s' % self.name
 
 
 class Tree:
@@ -100,7 +119,7 @@ def prune(node):
     right_label = get_label_from_patterns(node.right)
     parent_label = get_label_from_patterns(node)
     if left_label == right_label:
-        remove_childs(node)
+        remove_childrens(node)
         return
     results_list = {'left': (node.left.healthy_patterns,
                              node.left.trisomic_patterns),
@@ -112,15 +131,153 @@ def prune(node):
                       results_list['right'][right_label]) / total_patterns
     accuracy_after = results_list['parent'][parent_label] / total_patterns
     if accuracy_after >= accuracy_before:
-        remove_childs(node)
+        remove_childrens(node)
 
 
-def remove_childs(node):
+def remove_childrens(node):
     node.left = None
     node.right = None
     print 'removed nodes left=%s, right=%s from %s' % (node.left,
                                                       node.right,
                                                       node)
+
+
+def create_rules(tree):
+    for n, p in create_path(tree):
+        print n, p
+    return [Rule(p) for _, p in create_path(tree)]
+
+
+def create_path(tree):
+    for n, p in _create_path(tree.root, []):
+        # if n.is_leaf():
+            yield n, p
+
+
+def _create_path(node, path):
+    updated_path = path[:]
+    updated_path.append(node)
+    yield node, updated_path
+    if node.left:
+        for lc in _create_path(node.left, updated_path):
+            yield lc
+    if node.right:
+        for rc in _create_path(node.right, updated_path):
+            yield rc
+
+
+class Conjunction:
+    def __init__(self, condition, sign):
+        self.sign = sign
+        self.condition = condition
+
+    def compare_to_rule(self, val):
+        if self.sign == '<':
+            return val < self.condition
+        else:
+            return val >= self.condition
+
+    def __str__(self):
+        return 'val %s %s' % (self.sign, self.condition)
+
+    def __repr__(self):
+        return self.__str__()
+
+
+class Rule:
+    def __init__(self, nodes):
+        self.result = nodes[-1:][0].label
+        self.conjunction_dict = {}
+        self.set_conjunctions(nodes)
+
+    def set_conjunctions(self, nodes):
+        for i in xrange(len(nodes)-1):
+            sign = '<' if nodes[i].left == nodes[i+1] else '>='
+            conjunction = Conjunction(nodes[i].condition, sign)
+            self.conjunction_dict[nodes[i].name] = conjunction
+
+    def get_result(self):
+        return self.result
+
+    def check_match(self, input):
+        rule_matched = False
+        for k, v in self.conjunction_dict.items():
+            rule_matched = v.compare_to_rule(input[k])
+            if not rule_matched:
+                return rule_matched
+        return rule_matched
+
+    def __str__(self):
+        conj_str = ['%s: %s' % (k, v) for k, v in self.conjunction_dict.items()]
+        return ' and '.join(conj_str) + ',re = %s' % self.result
+
+def find_match(input, rules):
+    for r in rules:
+        if r.check_match(input):
+            return r
+    return None
+
+def rules_classification(inputs, rules):
+    labels = []
+    lost_matches = 0
+    for i in xrange(len(inputs.index)):
+        item = inputs.loc[i]
+        matched_rule = find_match(item, rules)
+        if matched_rule:
+            labels.append(matched_rule.get_result())
+        else:
+            print('Did not find rule for line = %s, mised value %s' % (i,
+                                                                       item['class_label']))
+            # labels.append(int(not item['class_label']))
+            labels.append(1.0)
+            lost_matches += 1
+    print('lost matches in total = %s' % lost_matches)
+    return np.array(labels)
+
+
+def print_rules(rules):
+    for r in rules:
+        print r
+
+def check_rules(inputs, tree):
+    rules = create_rules(tree)
+    pruned_rules = prune_rules(inputs, rules)
+    print('before pruning')
+    print_rules(rules)
+    print('after pruning')
+    print_rules(pruned_rules)
+    print('pruned rules')
+    print_rules(set(rules) - set(pruned_rules))
+
+
+
+def get_pessimistic_error(inputs, rules):
+    labels = rules_classification(inputs, rules)
+    e = 1 - accuracy(labels, inputs)
+    z = 0.674
+    n = len(labels)
+    nomitor = (e + z**2/(2*n) + z*mth.sqrt(e/n-e**2/n+z**2/(4*n**2)))
+    denominator = 1 + z**2/n
+    return nomitor/denominator
+
+
+def prune_rules(inputs, rules):
+    init_err = get_pessimistic_error(inputs, rules)
+    print('rules pesimistic error %s (before pruning)' % init_err)
+    pruned_rules = rules[:]
+    for i in xrange(len(rules)):
+        r = pruned_rules.pop()
+        pruned_err = get_pessimistic_error(inputs, pruned_rules)
+        if pruned_err < init_err:
+            print('pruned_err %s < init_err %s' % (pruned_err, init_err))
+            print('remove rule %s' % r)
+        else:
+            print('pruned_err %s >= init_err %s' % (pruned_err, init_err))
+            pruned_rules = [r,] + pruned_rules
+    return pruned_rules
+
+
+
 
 #TODO move function to node
 def get_label_from_patterns(node):
@@ -333,7 +490,8 @@ def classification(data, tree, count_patterns=False):
     return np.array(labels)
 
 def accuracy(labels, data):
-    print "Test accuracy: ", np.sum(data['class_label'].values == labels, dtype=np.float) / len(labels)
+    acc = np.sum(data['class_label'].values == labels, dtype=np.float) / len(labels)
+    return acc
 
 
 if __name__ == '__main__':
@@ -341,21 +499,28 @@ if __name__ == '__main__':
     if not do_not_rebuild_tree:
         tree = Tree()
         df = pd.read_csv(training_file)
-        TDIDT(df, tree, tree.root, max_depth=3)
+        TDIDT(df, tree, tree.root, max_depth=6)
 
         df = pd.read_csv(test_file)
         labels = classification(df, tree)
         np.savetxt('labels.csv', labels)
-        accuracy(labels, df)
+        acc = accuracy(labels, df)
+        print "Test accuracy: %s" % acc
         graphVis(tree, 'tr.dot')
 
         pickle.dump(tree, open(tree_dump_file, 'w'))
     else:
-        tree = loaded_tree = pickle.load(open(tree_dump_file, 'r'))
+        tree = pickle.load(open(tree_dump_file, 'r'))
         post_traversal_wrapper(tree)
         df = pd.read_csv(test_file)
         labels = classification(df, tree)
-        accuracy(labels, df)
+        acc = accuracy(labels, df)
+        print "Test accuracy: %s" % acc
         graphVis(tree, 'pruned_tree.dot')
+
+        tree = pickle.load(open(tree_dump_file, 'r'))
+        create_rules(tree)
+        check_rules(df, tree)
+
 
 
