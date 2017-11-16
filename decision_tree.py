@@ -7,6 +7,7 @@ import math as mth
 import operator
 import logging
 
+from argparse import ArgumentParser
 from collections import Counter, defaultdict
 
 tree_dump_file = 'tree.txt'
@@ -17,7 +18,25 @@ trisomic = 1
 healthy = 0
 
 
+parser = ArgumentParser(description='assignment3')
+parser.add_argument('--build-tree',
+                    action='store_true',
+                    default=False,
+                    help='Build the decision tree'
+                    )
+parser.add_argument('--prune-tree',
+                    action='store_true',
+                    default=False,
+                    help='Prune decision tree'
+                    )
+parser.add_argument('--build-rules',
+                    action='store_true',
+                    default=True,
+                    help='Build rules and then prune them'
+                    )
+
 logger = logging.getLogger('decision tree logger')
+logger.setLevel(logging.DEBUG)
 fh = logging.FileHandler(log_file)
 fh.setLevel(logging.DEBUG)
 ch = logging.StreamHandler()
@@ -111,9 +130,9 @@ def post_traversal(node):
 
 def prune(node):
     if node.right is None:
-        print "error no right child"
+        logger.error("error no right child")
     if node.left is None:
-        print "error no left child"
+        logger.error("error no right child")
 
     left_label = get_label_from_patterns(node.left)
     right_label = get_label_from_patterns(node.right)
@@ -137,20 +156,20 @@ def prune(node):
 def remove_childrens(node):
     node.left = None
     node.right = None
-    print 'removed nodes left=%s, right=%s from %s' % (node.left,
-                                                      node.right,
-                                                      node)
-
+    logger.debug('removed nodes left=%s, right=%s from %s' % (node.left,
+                                                              node.right,
+                                                              node))
 
 def create_rules(tree):
     for n, p in create_path(tree):
-        print n, p
+        logger.debug('created rules= %s : %s' % (n, p))
     return [Rule(p) for _, p in create_path(tree)]
 
 
 def create_path(tree):
     for n, p in _create_path(tree.root, []):
         # if n.is_leaf():
+        if len(p) > 1:
             yield n, p
 
 
@@ -195,6 +214,8 @@ class Rule:
             sign = '<' if nodes[i].left == nodes[i+1] else '>='
             conjunction = Conjunction(nodes[i].condition, sign)
             self.conjunction_dict[nodes[i].name] = conjunction
+        if self.conjunction_dict == {}:
+            logger.error('Rule without conjuctions' % self)
 
     def get_result(self):
         return self.result
@@ -211,6 +232,7 @@ class Rule:
         conj_str = ['%s: %s' % (k, v) for k, v in self.conjunction_dict.items()]
         return ' and '.join(conj_str) + ',re = %s' % self.result
 
+
 def find_match(input, rules):
     for r in rules:
         if r.check_match(input):
@@ -226,29 +248,30 @@ def rules_classification(inputs, rules):
         if matched_rule:
             labels.append(matched_rule.get_result())
         else:
-            print('Did not find rule for line = %s, mised value %s' % (i,
+            logger.debug('Did not find rule for line = %s, mised value %s' % (i,
                                                                        item['class_label']))
-            # labels.append(int(not item['class_label']))
-            labels.append(1.0)
+            labels.append(int(not item['class_label']))
+            # labels.append(1.0)
             lost_matches += 1
-    print('lost matches in total = %s' % lost_matches)
+    logger.debug('lost matches in total = %s' % lost_matches)
     return np.array(labels)
 
 
 def print_rules(rules):
+    print('=====================================')
     for r in rules:
         print r
 
-def check_rules(inputs, tree):
-    rules = create_rules(tree)
+
+def check_rules(inputs, rules):
     pruned_rules = prune_rules(inputs, rules)
-    print('before pruning')
+    print('rules before pruning')
     print_rules(rules)
-    print('after pruning')
+    print('rules after pruning')
     print_rules(pruned_rules)
     print('pruned rules')
     print_rules(set(rules) - set(pruned_rules))
-
+    return pruned_rules
 
 
 def get_pessimistic_error(inputs, rules):
@@ -263,20 +286,17 @@ def get_pessimistic_error(inputs, rules):
 
 def prune_rules(inputs, rules):
     init_err = get_pessimistic_error(inputs, rules)
-    print('rules pesimistic error %s (before pruning)' % init_err)
     pruned_rules = rules[:]
     for i in xrange(len(rules)):
         r = pruned_rules.pop()
         pruned_err = get_pessimistic_error(inputs, pruned_rules)
         if pruned_err < init_err:
-            print('pruned_err %s < init_err %s' % (pruned_err, init_err))
-            print('remove rule %s' % r)
+            logger.debug('pruned_err %s < init_err %s' % (pruned_err, init_err))
+            logger.debug('remove rule %s' % r)
         else:
-            print('pruned_err %s >= init_err %s' % (pruned_err, init_err))
+            logger.debug('pruned_err %s >= init_err %s' % (pruned_err, init_err))
             pruned_rules = [r,] + pruned_rules
     return pruned_rules
-
-
 
 
 #TODO move function to node
@@ -496,7 +516,8 @@ def accuracy(labels, data):
 
 if __name__ == '__main__':
     do_not_rebuild_tree = True
-    if not do_not_rebuild_tree:
+    args = parser.parse_args()
+    if args.build_tree:
         tree = Tree()
         df = pd.read_csv(training_file)
         TDIDT(df, tree, tree.root, max_depth=6)
@@ -507,9 +528,9 @@ if __name__ == '__main__':
         acc = accuracy(labels, df)
         print "Test accuracy: %s" % acc
         graphVis(tree, 'tr.dot')
-
         pickle.dump(tree, open(tree_dump_file, 'w'))
-    else:
+
+    if args.prune_tree:
         tree = pickle.load(open(tree_dump_file, 'r'))
         post_traversal_wrapper(tree)
         df = pd.read_csv(test_file)
@@ -518,9 +539,12 @@ if __name__ == '__main__':
         print "Test accuracy: %s" % acc
         graphVis(tree, 'pruned_tree.dot')
 
+    if args.build_rules:
+        df = pd.read_csv(training_file)
         tree = pickle.load(open(tree_dump_file, 'r'))
-        create_rules(tree)
-        check_rules(df, tree)
-
-
-
+        rules = create_rules(tree)
+        pruned_rules = check_rules(df, rules)
+        init_err = get_pessimistic_error(df, rules)
+        pruned_err = get_pessimistic_error(df, pruned_rules)
+        print('rules pesimistic error %s (before pruning)' % init_err)
+        print('rules pesimistic error %s (after pruning)' % pruned_err)
