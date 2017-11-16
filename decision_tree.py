@@ -1,8 +1,17 @@
+#!/usr/bin/env python2.7
+
 import pandas as pd
 import numpy as np
+import cPickle as pickle
 import operator
+
 from collections import Counter, defaultdict
 
+tree_dump_file = 'tree.txt'
+training_file = './gene_expression_training_orig_full.csv'
+test_file = './gene_expression_test_orig_full.csv'
+trisomic = 1
+healthy = 0
 
 class Node:
     def __init__(self):
@@ -15,6 +24,19 @@ class Node:
         self.samples = 0
         self.healthy = 0
         self.trisomic = 0
+        self.healthy_patterns = 0
+        self.trisomic_patterns = 0
+
+    def is_leaf(self):
+        return self.left is None and self.right is None
+
+    def __str__(self):
+        return 'node %s, healthy: %s, trisomic: %s, left: %s, right: %s' % (
+            self.name,
+            self.healthy_patterns,
+            self.trisomic_patterns,
+            self.left,
+            self.right)
 
 
 class Tree:
@@ -49,6 +71,64 @@ class Tree:
             # self.output(node.right)
 
 
+def post_traversal(node):
+    if node.left:
+        if not node.left.is_leaf():
+            post_traversal(node.left)
+        else:
+            prune(node)
+            return
+
+    if node.right:
+        if not node.right.is_leaf():
+            post_traversal(node.right)
+        else:
+            prune(node)
+            return
+
+    if node.right.is_leaf() and node.left.is_leaf():
+        prune(node)
+
+
+def prune(node):
+    if node.right is None:
+        print "error no right child"
+    if node.left is None:
+        print "error no left child"
+
+    left_label = get_label_from_patterns(node.left)
+    right_label = get_label_from_patterns(node.right)
+    parent_label = get_label_from_patterns(node)
+    if left_label == right_label:
+        remove_childs(node)
+        return
+    results_list = {'left': (node.left.healthy_patterns,
+                             node.left.trisomic_patterns),
+                    'right': (node.right.healthy_patterns,
+                              node.right.trisomic_patterns),
+                    'parent': (node.healthy_patterns, node.trisomic_patterns)}
+    total_patterns = float(node.healthy_patterns + node.trisomic_patterns)
+    accuracy_before = (results_list['left'][left_label] +
+                      results_list['right'][right_label]) / total_patterns
+    accuracy_after = results_list['parent'][parent_label] / total_patterns
+    if accuracy_after >= accuracy_before:
+        remove_childs(node)
+
+
+def remove_childs(node):
+    node.left = None
+    node.right = None
+    print 'removed nodes left=%s, right=%s from %s' % (node.left,
+                                                      node.right,
+                                                      node)
+
+#TODO move function to node
+def get_label_from_patterns(node):
+    return trisomic if node.trisomic_patterns >= node.healthy_patterns else \
+        healthy
+
+def post_traversal_wrapper(tree):
+    post_traversal(tree.root)
 
 
 def entropy(*probs):
@@ -86,6 +166,7 @@ def conditional_entropy(attr, attr_name, threshold):
 
     return intermidiate_res
 
+
 def gain_continious(attr, attr_name):
 #     attr_name = attr.columns[index_attr]
     attr = attr.sort_values(by=[attr_name])
@@ -110,12 +191,14 @@ def gain_continious(attr, attr_name):
     return_val = (gain, gain_dic[index][1])
     return return_val
 
+
 def best_threshold(attr):
     max_gain = (-1, None, 0)
     for a_name in attr.columns[:-1]:
         current_gain, threshold = gain_continious(attr, a_name)
         max_gain = max_gain if max_gain[0] >= current_gain else (current_gain, a_name, threshold)
     return max_gain
+
 
 def TDIDT(attr, tree, node, node_side=None, max_depth=10):
     # attr = attr_orig.copy()
@@ -160,13 +243,25 @@ def print_node(node, file_name, root, dependencies):
     color = ['#399de506', '#e58139b0']
     if node.left == None and node.right == None:
         with open(file_name, 'a') as f:
-            f.write('{} [label=<samples={}<br/>\nhealthy: {}, trisomic: {}<br/>class = {}>, fillcolor="{}"] ;\n'
-                    .format(root, node.samples, node.healthy, node.trisomic, node.label, color[int(node.label)]))
+            f.write('{} [label=<samples={}<br/>\n'
+                    'healthy: {}, trisomic: {}<br/>\n'
+                    'tested healthy: {}, tested trisomatic: {}<br/>\n '
+                    'class= {}>, fillcolor="{}"] ;\n'
+                    .format(root, node.samples,
+                            node.healthy, node.trisomic,
+                            node.healthy_patterns, node.trisomic_patterns,
+                            node.label, color[int(node.label)]))
         return
 
     with open(file_name, 'a') as f:
-        f.write('{} [label=<{} &le; {}<br/>samples = {}<br/>\nhealthy: {}, trisomic: {}<br/>class = {}>, fillcolor="{}"] ;\n'
-                .format(root, node.name, node.condition, node.samples, node.healthy, node.trisomic, node.label, color[int(node.label)]))
+        f.write('{} [label=<{} &le; {}<br/>samples = {}<br/>\n'
+                'healthy: {}, trisomic: {}<br/>\n'
+                'tested healthy: {}, tested trisomatic: {}<br/>\n'
+                'class = {}>, fillcolor="{}"] ;\n'
+                .format(root, node.name, node.condition, node.samples,
+                        node.healthy, node.trisomic,
+                        node.healthy_patterns, node.trisomic_patterns,
+                        node.label, color[int(node.label)]))
 
     new_root = check_dependencies(dependencies, root)
     dependencies[root].append(new_root)
@@ -204,12 +299,34 @@ def fit(row, node):
     else:
         return node.right
 
-def classification(data, tree):
+
+def clean_test_patterns(func):
+    def wrapper(*args):
+        _clean_test_patterns(tree.root)
+        return func(*args)
+    return wrapper
+
+def _clean_test_patterns(node):
+    if node.left is not None:
+        _clean_test_patterns(node.left)
+    if node.right is not None:
+        _clean_test_patterns(node.right)
+    node.healthy_patterns = 0
+    node.trisomic_patterns = 0
+
+
+@clean_test_patterns
+def classification(data, tree, count_patterns=False):
     labels = []
     for i in data.index:
         node = tree.root
+
         while 1:
             node = fit(data.loc[[i]], node)
+            if data.loc[i]['class_label'] == trisomic:
+                node.trisomic_patterns += 1
+            else:
+                node.healthy_patterns += 1
             if node.left == None and node.right == None:
                 labels.append(node.label)
                 break
@@ -220,14 +337,25 @@ def accuracy(labels, data):
 
 
 if __name__ == '__main__':
-    tree = Tree()
-    # df = data
-    df = pd.read_csv('./gene_expression_training_orig.csv')
-    TDIDT(df, tree, tree.root, max_depth=1)
+    do_not_rebuild_tree = True
+    if not do_not_rebuild_tree:
+        tree = Tree()
+        df = pd.read_csv(training_file)
+        TDIDT(df, tree, tree.root, max_depth=3)
 
-    df = pd.read_csv('./gene_expression_test_orig.csv')
-    labels = classification(df, tree)
-    np.savetxt('labels.csv', labels)
-    accuracy(labels, df)
-    graphVis(tree, 'tr.dot')
+        df = pd.read_csv(test_file)
+        labels = classification(df, tree)
+        np.savetxt('labels.csv', labels)
+        accuracy(labels, df)
+        graphVis(tree, 'tr.dot')
+
+        pickle.dump(tree, open(tree_dump_file, 'w'))
+    else:
+        tree = loaded_tree = pickle.load(open(tree_dump_file, 'r'))
+        post_traversal_wrapper(tree)
+        df = pd.read_csv(test_file)
+        labels = classification(df, tree)
+        accuracy(labels, df)
+        graphVis(tree, 'pruned_tree.dot')
+
 
