@@ -12,8 +12,11 @@ from collections import Counter, defaultdict
 
 tree_dump_file = 'tree.txt'
 training_file = './gene_expression_training_orig_full.csv'
+missed_data_file = 'gene_expression_with_missing_values.csv'
 test_file = './gene_expression_test_orig_full.csv'
 log_file = './decision_tree.log'
+pruned_tree_dot = 'pruned_tree.dot'
+pessimistic_pruned_tree_dot = 'pessimistic_pruned_tree.dot'
 trisomic = 1
 healthy = 0
 
@@ -21,12 +24,12 @@ healthy = 0
 parser = ArgumentParser(description='assignment3')
 parser.add_argument('--build-tree',
                     action='store_true',
-                    default=False,
+                    default=True,
                     help='Build the decision tree'
                     )
 parser.add_argument('--prune-tree',
                     action='store_true',
-                    default=False,
+                    default=True,
                     help='Prune decision tree'
                     )
 parser.add_argument('--build-rules',
@@ -109,26 +112,26 @@ class Tree:
             # self.output(node.right)
 
 
-def post_traversal(node):
+def post_traversal(node, use_pessimistic):
     if node.left:
         if not node.left.is_leaf():
-            post_traversal(node.left)
+            post_traversal(node.left, use_pessimistic)
         else:
-            prune(node)
+            prune(node, use_pessimistic)
             return
 
     if node.right:
         if not node.right.is_leaf():
-            post_traversal(node.right)
+            post_traversal(node.right, use_pessimistic)
         else:
-            prune(node)
+            prune(node, use_pessimistic)
             return
 
     if node.right.is_leaf() and node.left.is_leaf():
-        prune(node)
+        prune(node, use_pessimistic)
 
 
-def prune(node):
+def prune(node, use_pessimistic=False):
     if node.right is None:
         logger.error("error no right child")
     if node.left is None:
@@ -149,8 +152,15 @@ def prune(node):
     accuracy_before = (results_list['left'][left_label] +
                       results_list['right'][right_label]) / total_patterns
     accuracy_after = results_list['parent'][parent_label] / total_patterns
-    if accuracy_after >= accuracy_before:
-        remove_childrens(node)
+
+    if use_pessimistic:
+        init_err = get_pessimistic_error(1-accuracy_before, total_patterns)
+        pruned_err = get_pessimistic_error(1-accuracy_after, total_patterns)
+        if init_err >= pruned_err:
+            remove_childrens(node)
+    else:
+        if accuracy_after >= accuracy_before:
+            remove_childrens(node)
 
 
 def remove_childrens(node):
@@ -273,23 +283,26 @@ def check_rules(inputs, rules):
     print_rules(set(rules) - set(pruned_rules))
     return pruned_rules
 
-
-def get_pessimistic_error(inputs, rules):
+def pessimistic_error_wrapper(inputs, rules):
     labels = rules_classification(inputs, rules)
     e = 1 - accuracy(labels, inputs)
-    z = 0.674
     n = len(labels)
+    return get_pessimistic_error(e, n)
+
+
+def get_pessimistic_error(e, n):
+    z = 0.674
     nomitor = (e + z**2/(2*n) + z*mth.sqrt(e/n-e**2/n+z**2/(4*n**2)))
     denominator = 1 + z**2/n
     return nomitor/denominator
 
 
 def prune_rules(inputs, rules):
-    init_err = get_pessimistic_error(inputs, rules)
+    init_err = pessimistic_error_wrapper(inputs, rules)
     pruned_rules = rules[:]
     for i in xrange(len(rules)):
         r = pruned_rules.pop()
-        pruned_err = get_pessimistic_error(inputs, pruned_rules)
+        pruned_err = pessimistic_error_wrapper(inputs, pruned_rules)
         if pruned_err < init_err:
             logger.debug('pruned_err %s < init_err %s' % (pruned_err, init_err))
             logger.debug('remove rule %s' % r)
@@ -304,8 +317,9 @@ def get_label_from_patterns(node):
     return trisomic if node.trisomic_patterns >= node.healthy_patterns else \
         healthy
 
-def post_traversal_wrapper(tree):
-    post_traversal(tree.root)
+
+def get_pruned_tree(tree, use_pessimistic=False):
+    post_traversal(tree.root, use_pessimistic)
 
 
 def entropy(*probs):
@@ -479,7 +493,7 @@ def fit(row, node):
 
 def clean_test_patterns(func):
     def wrapper(*args):
-        _clean_test_patterns(tree.root)
+        _clean_test_patterns(args[1].root)
         return func(*args)
     return wrapper
 
@@ -514,13 +528,61 @@ def accuracy(labels, data):
     return acc
 
 
+def pruned_basycs(df, tree, use_pessimistics=False):
+    get_pruned_tree(tree, use_pessimistic=False)
+    labels = classification(df, tree)
+    acc = accuracy(labels, df)
+    msg = "Test accuracy: %s"
+    tree_file = pruned_tree_dot
+    if use_pessimistics:
+        tree_file = pessimistic_pruned_tree_dot
+        msg += ' (using pessimistic error)'
+    graphVis(t_pruned_by_heuristic, tree_file)
+    print msg % acc
+
+
+def test_random(tree=None, rules=None):
+    # cycles
+    n = 10
+    accurancies = []
+    for i in xrange(n):
+        df = pd.read_csv(missed_data_file)
+        df[np.isnan(df)] = np.random.random((df.shape))
+        if tree:
+            labels = classification(df, tree)
+            accurancies.append(accuracy(labels, df))
+        if rules:
+            accurancies.append(1-pessimistic_error_wrapper(df, rules))
+    return sum(accurancies)/float(n)
+
+
+def test_set_for_tree(tree):
+    accuracy_dict = {}
+    df = pd.read_csv(missed_data_file)
+    df_median = df.fillna(df.median())
+    df_mean = df.fillna(df.mean())
+    accuracy_dict['median'] = accuracy(classification(df_median, tree), df_median)
+    accuracy_dict['mean'] = accuracy(classification(df_mean, tree), df_mean)
+    accuracy_dict['random'] = test_random(tree=tree)
+    return accuracy_dict
+
+def test_set_for_rules(rules):
+    accuracy_dict = {}
+    df = pd.read_csv(missed_data_file)
+    df_median = df.fillna(df.median())
+    df_mean = df.fillna(df.mean())
+    accuracy_dict['median'] = 1-pessimistic_error_wrapper(df_median, rules)
+    accuracy_dict['mean'] = 1-pessimistic_error_wrapper(df_mean, rules)
+    accuracy_dict['random'] = test_random(rules=rules)
+    return accuracy_dict
+
+
 if __name__ == '__main__':
-    do_not_rebuild_tree = True
     args = parser.parse_args()
     if args.build_tree:
         tree = Tree()
         df = pd.read_csv(training_file)
-        TDIDT(df, tree, tree.root, max_depth=6)
+        TDIDT(df, tree, tree.root, max_depth=3)
 
         df = pd.read_csv(test_file)
         labels = classification(df, tree)
@@ -531,20 +593,29 @@ if __name__ == '__main__':
         pickle.dump(tree, open(tree_dump_file, 'w'))
 
     if args.prune_tree:
-        tree = pickle.load(open(tree_dump_file, 'r'))
-        post_traversal_wrapper(tree)
         df = pd.read_csv(test_file)
-        labels = classification(df, tree)
-        acc = accuracy(labels, df)
-        print "Test accuracy: %s" % acc
-        graphVis(tree, 'pruned_tree.dot')
+        t_pruned_by_heuristic = pickle.load(open(tree_dump_file, 'r'))
+        pruned_basycs(df, t_pruned_by_heuristic)
+
+        t_pruned_by_pessimistic = pickle.load(open(tree_dump_file, 'r'))
+        pruned_basycs(df, t_pruned_by_pessimistic, use_pessimistics=True)
+
+        tree = pickle.load(open(tree_dump_file, 'r'))
+        print('Init tree accuracies %s' % test_set_for_tree(tree))
+        print('Heuristic pruned accuracies %s' %
+              test_set_for_tree(t_pruned_by_heuristic))
+        print('Pessimistic pruned accuraices %s' %
+              test_set_for_tree(t_pruned_by_pessimistic))
 
     if args.build_rules:
         df = pd.read_csv(training_file)
         tree = pickle.load(open(tree_dump_file, 'r'))
         rules = create_rules(tree)
         pruned_rules = check_rules(df, rules)
-        init_err = get_pessimistic_error(df, rules)
-        pruned_err = get_pessimistic_error(df, pruned_rules)
-        print('rules pesimistic error %s (before pruning)' % init_err)
-        print('rules pesimistic error %s (after pruning)' % pruned_err)
+        init_err = pessimistic_error_wrapper(df, rules)
+        pruned_err = pessimistic_error_wrapper(df, pruned_rules)
+        print('rules accuracy %s (before pruning)' % (1-init_err))
+        print('rules accuracy %s (after pruning)' % (1-pruned_err))
+        print('Rules accuraices %s' %
+              test_set_for_rules(pruned_rules))
+
